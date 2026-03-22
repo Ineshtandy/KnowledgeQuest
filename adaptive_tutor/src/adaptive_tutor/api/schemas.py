@@ -22,6 +22,12 @@ class QuestionResponse(BaseModel):
     topic: str
     question: dict | None
     session_complete: bool
+    display_text: str
+    input_mode: str
+    ui_events: list[str] = Field(default_factory=list)
+    display_text: str
+    input_mode: str
+    ui_events: list[str] = Field(default_factory=list)
 
 
 class AnswerResponse(BaseModel):
@@ -32,3 +38,9 @@ class AnswerResponse(BaseModel):
     session_complete: bool
     next_action: str | None = None
     current_level_index: int = 0
+    display_text: str
+    input_mode: str
+    ui_events: list[str] = Field(default_factory=list)
+    display_text: str
+    input_mode: str
+    ui_events: list[str] = Field(default_factory=list)

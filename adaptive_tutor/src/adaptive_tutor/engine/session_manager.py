@@ -65,7 +65,8 @@ def load_session(session_id: str) -> GraphState | None:
     if teachings:
         t = teachings[-1]
         current_teaching = TeachingPayload(
-            concept_title="",
+            # Attempt rows do not currently persist concept_title, so use a stable fallback.
+            concept_title="Recovered concept",
             summary=t.summary,
             why_user_was_wrong=t.why_user_was_wrong,
             worked_example=t.worked_example,
