@@ -1,6 +1,12 @@
 import pygame
 import sys
 import random
+import json
+import threading
+import queue
+import urllib.request
+import urllib.error
+from collections import deque
 from PIL import Image
 
 pygame.init()
@@ -86,12 +92,23 @@ class BossSprite:
 
 # Golden Arrow Bullet class
 class Bullet:
-    def __init__(self, x, y, target_y, speed=12):
+    def __init__(
+        self,
+        x: int,
+        y: int,
+        target_y: int,
+        *,
+        speed: int = 12,
+        authorized_damage: int = 0,
+        phase_id: int = 0,
+    ):
         self.x = x
         self.y = y
         self.target_y = target_y
         self.speed = speed
         self.hit = False
+        self.authorized_damage = authorized_damage
+        self.phase_id = phase_id
 
     def update(self):
         if self.y > self.target_y:
@@ -116,11 +133,25 @@ cowboy_width, cowboy_height = cowboy_img.get_size()
 # boss setup
 bosses = [BossSprite("dragon.avif", 0.5), BossSprite("dragon.avif", 0.5)]
 boss_index = 0
-boss_hp_list = [100, 150]
-boss_hp = boss_hp_list[boss_index]
-hp_anim_current = boss_hp
+
+# Visual HP rules (presentation only):
+# - max hp always 100
+# - 25 hits to clear => 4 hp per authorized hit
+# - hp cannot reach 0 until backend sends level_advanced/session_finished
+boss_visual_hp_max = 100
+hits_to_clear = 4
+hp_chunk = boss_visual_hp_max // hits_to_clear
+
+boss_visual_hp = boss_visual_hp_max
+hp_anim_current = boss_visual_hp
+boss_phase_id = 0
 transitioning = False
 damage_flash = 0
+session_finished = False
+
+campfire_mode = False
+shake_timer = 0
+shake_magnitude = 4
 
 # road setup
 road_bottom_width = 280  # slightly wider
@@ -132,16 +163,81 @@ scroll_offset = 0.0
 scroll_speed = 2.5
 sky_height = 80
 
-# test questions
-def get_question():
-    return random.choice([
-        {"question":"7 x 8?", "options":["54","56","64","49"], "answer":"56"},
-        {"question":"Capital of France?", "options":["Paris","Rome","Berlin","Madrid"], "answer":"Paris"}
-    ])
+# Backend-driven state
+API_BASE_URL = "http://127.0.0.1:8000"
+session_id: str | None = None
+display_text = "What would you like to learn?"
+input_mode = "topic"  # topic | answer | session_complete
+awaiting_backend = False
+pending_events: deque[str] = deque()
+response_queue: queue.Queue[dict] = queue.Queue()
 
-current_question = get_question()
+
+def _post_json(url: str, payload: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _submit_to_backend(text: str) -> None:
+    global session_id
+    try:
+        if session_id is None:
+            result = _post_json(f"{API_BASE_URL}/sessions", {"topic": text})
+        else:
+            result = _post_json(f"{API_BASE_URL}/sessions/{session_id}/answer", {"answer": text})
+        response_queue.put({"ok": True, "result": result})
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        response_queue.put({"ok": False, "error": str(exc)})
+
+
+def _render_wrapped_text(surface: pygame.Surface, text: str, rect: pygame.Rect, color: tuple[int, int, int]) -> None:
+    words = (text or "").replace("\n", " \n ").split(" ")
+    x, y = rect.x, rect.y
+    line: list[str] = []
+    space_w = font.size(" ")[0]
+    max_w = rect.width
+    line_h = font.get_linesize()
+
+    def flush_line() -> None:
+        nonlocal x, y, line
+        if not line:
+            return
+        rendered = font.render(" ".join(line), True, color)
+        surface.blit(rendered, (x, y))
+        y += line_h
+        line = []
+
+    for w in words:
+        if w == "\\n":
+            flush_line()
+            continue
+        test = (" ".join(line + [w])).strip()
+        if test and font.size(test)[0] <= max_w:
+            line.append(w)
+        else:
+            flush_line()
+            if font.size(w)[0] <= max_w:
+                line = [w]
+            else:
+                # hard break very long tokens
+                for ch in w:
+                    test2 = ("".join(line) + ch)
+                    if font.size(test2)[0] <= max_w:
+                        line.append(ch)
+                    else:
+                        flush_line()
+                        line = [ch]
+    flush_line()
 user_input = ""
 feedback = ""
+feedback_color = RED
 
 # set gameplay surface
 gameplay_surface = pygame.Surface((WIDTH, gameplay_height))
@@ -151,16 +247,56 @@ running = True
 while running:
     screen.fill(DESERT_SAND)
 
+    # consume backend responses (non-blocking)
+    while True:
+        try:
+            msg = response_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        awaiting_backend = False
+        if not msg.get("ok"):
+            feedback = "Network error"
+            feedback_color = RED
+            pending_events.append("error_state")
+            continue
+
+        result = msg.get("result") or {}
+        if session_id is None and result.get("session_id"):
+            session_id = result.get("session_id")
+
+        display_text = str(result.get("display_text") or display_text)
+        input_mode = str(result.get("input_mode") or input_mode)
+        events = result.get("ui_events") or []
+        if isinstance(events, list):
+            for e in events:
+                if isinstance(e, str):
+                    pending_events.append(e)
+        if bool(result.get("session_complete")):
+            session_finished = True
+
     # question panel
     pygame.draw.rect(screen, WHITE, (0, 0, WIDTH, question_panel_height))
     pygame.draw.rect(screen, BLACK, (0, 0, WIDTH, question_panel_height), 2)
-    screen.blit(font.render(current_question["question"], True, BLACK), (10, 40))
+    _render_wrapped_text(
+        screen,
+        display_text,
+        pygame.Rect(10, 10, WIDTH - 20, question_panel_height - 20),
+        BLACK,
+    )
 
     # chatbot panel
     pygame.draw.rect(screen, WHITE, (0, HEIGHT-chatbot_panel_height, WIDTH, chatbot_panel_height))
     pygame.draw.rect(screen, BLACK, (0, HEIGHT-chatbot_panel_height, WIDTH, chatbot_panel_height), 2)
-    screen.blit(font.render("Type your answer: " + user_input, True, BLACK), (10, HEIGHT-90))
-    screen.blit(font.render(feedback, True, RED), (10, HEIGHT-50))
+    if input_mode == "topic":
+        prompt = "Type a topic: "
+    elif input_mode == "session_complete":
+        prompt = "Session complete"
+    else:
+        prompt = "Type your answer: "
+
+    screen.blit(font.render(prompt + user_input, True, BLACK), (10, HEIGHT-90))
+    screen.blit(font.render(feedback, True, feedback_color), (10, HEIGHT-50))
 
     # fill initial game surface
     gameplay_surface.fill(DESERT_SAND)
@@ -199,18 +335,58 @@ while running:
     cowboy_x = WIDTH // 2
     cowboy_y = gameplay_height - 60
 
+    # Play pending backend-driven events (stop when one starts a transition)
+    while pending_events and not transitioning:
+        evt = pending_events.popleft()
+        if evt == "answer_correct":
+            bullets.append(
+                Bullet(
+                    cowboy_x,
+                    cowboy_y,
+                    100,
+                    authorized_damage=hp_chunk,
+                    phase_id=boss_phase_id,
+                )
+            )
+            feedback = "Hit!"
+            feedback_color = GREEN
+        elif evt == "answer_incorrect":
+            feedback = "Miss!"
+            feedback_color = RED
+            shake_timer = 12
+        elif evt == "teaching_started":
+            campfire_mode = True
+        elif evt == "level_demoted":
+            boss_visual_hp = 75
+            if hp_anim_current < boss_visual_hp:
+                hp_anim_current = boss_visual_hp
+        elif evt == "level_advanced":
+            # HP may become 0 only as a finisher for backend-approved advancement.
+            boss_visual_hp = 0
+            hp_anim_current = 0
+            transitioning = True
+        elif evt == "session_finished":
+            session_finished = True
+            boss_visual_hp = 0
+            hp_anim_current = 0
+        elif evt == "error_state":
+            feedback = "Backend error"
+            feedback_color = RED
+        # question_presented/state_synced: no direct animation needed in MVP
+
     # draw bullets
     for bullet in bullets[:]:
         bullet.update()
         bullet.draw(gameplay_surface)
         if bullet.hit:
-            boss_hp -= 10
-            boss_hp = max(boss_hp, 0)
-            damage_flash = 15
+            # Late-hit protection: ignore hits during transitions or after phase change.
+            if (not transitioning) and bullet.phase_id == boss_phase_id and bullet.authorized_damage > 0:
+                boss_visual_hp = max(1, boss_visual_hp - int(bullet.authorized_damage))
+                damage_flash = 15
             bullets.remove(bullet)
 
     # boss setup
-    if boss_index < len(bosses) and boss_hp > 0 and not transitioning:
+    if boss_index < len(bosses) and boss_visual_hp > 0 and not transitioning:
         boss = bosses[boss_index]
         if damage_flash > 0:
             img = boss.image.copy()
@@ -221,15 +397,21 @@ while running:
             boss.draw(gameplay_surface, WIDTH//2, 100, 0.5)
 
     # create HP box
-    if boss_hp > 0:
-        if hp_anim_current > boss_hp:
+    if boss_visual_hp > 0:
+        if hp_anim_current > boss_visual_hp:
             hp_anim_current -= 1
         pygame.draw.rect(gameplay_surface, BLACK, (620,10,150,40))
         pygame.draw.rect(gameplay_surface, WHITE, (620,10,150,40),2)
         pygame.draw.rect(gameplay_surface, RED, (622,12,146,36))
-        green_w = int(146 * (hp_anim_current / boss_hp_list[boss_index]))
+        green_w = int(146 * (hp_anim_current / boss_visual_hp_max))
         pygame.draw.rect(gameplay_surface, GREEN, (622,12,green_w,36))
-        gameplay_surface.blit(font.render(f"{boss_hp}", True, WHITE), (670,20))
+        gameplay_surface.blit(font.render(f"{boss_visual_hp}", True, WHITE), (670,20))
+
+    # Teaching/campfire overlay
+    if campfire_mode and not transitioning:
+        overlay = pygame.Surface((WIDTH, gameplay_height), pygame.SRCALPHA)
+        overlay.fill((255, 200, 120, 80))
+        gameplay_surface.blit(overlay, (0, 0))
 
     # Draw cowboy 
     gameplay_surface.blit(
@@ -237,41 +419,49 @@ while running:
         (cowboy_x - cowboy_width // 2, cowboy_y - cowboy_height // 2)
     )
 
-    screen.blit(gameplay_surface, (0, gameplay_top))
+    # Optional screen shake
+    shake_x = 0
+    shake_y = 0
+    if shake_timer > 0:
+        shake_timer -= 1
+        shake_x = random.randint(-shake_magnitude, shake_magnitude)
+        shake_y = random.randint(-shake_magnitude, shake_magnitude)
+
+    screen.blit(gameplay_surface, (0 + shake_x, gameplay_top + shake_y))
 
     # Events
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.KEYDOWN and not transitioning:
+        elif event.type == pygame.KEYDOWN and not transitioning and not session_finished:
             if event.key == pygame.K_RETURN:
-                if user_input.lower() == current_question["answer"].lower():
-                    bullets.append(Bullet(cowboy_x, cowboy_y, 100))
-                    feedback = "Hit!"
-                else:
-                    feedback = "Miss!"
+                typed = user_input.strip()
+                if not typed or awaiting_backend:
+                    continue
+                awaiting_backend = True
+                feedback = "Thinking..."
+                feedback_color = BLACK
                 user_input = ""
-                current_question = get_question()
+                t = threading.Thread(target=_submit_to_backend, args=(typed,), daemon=True)
+                t.start()
             elif event.key == pygame.K_BACKSPACE:
                 user_input = user_input[:-1]
             else:
                 user_input += event.unicode
-
-    # Boss death
-    if boss_hp <= 0 and not transitioning:
-        transitioning = True
 
     if transitioning:
         scroll_offset += scroll_speed
         if scroll_offset >= gameplay_height:
             scroll_offset = 0
             transitioning = False
-            boss_index += 1
-            if boss_index < len(bosses):
-                boss_hp = boss_hp_list[boss_index]
-                hp_anim_current = boss_hp
-            else:
-                running = False
+            boss_phase_id += 1
+            # Advance boss sprite if available, otherwise keep the last one.
+            if boss_index < len(bosses) - 1:
+                boss_index += 1
+            boss_visual_hp = boss_visual_hp_max
+            hp_anim_current = boss_visual_hp_max
+            bullets.clear()
+            damage_flash = 0
 
     pygame.display.flip()
     clock.tick(60)

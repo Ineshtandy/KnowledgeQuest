@@ -11,6 +11,9 @@ def test_session_creation_endpoint_works(monkeypatch):
             "topic": topic,
             "question": {"question_text": "What is supervised learning?", "question_id": "q1"},
             "session_complete": False,
+            "display_text": "Question: What is supervised learning?",
+            "input_mode": "answer",
+            "ui_events": ["session_started", "curriculum_planned", "question_presented", "state_synced"],
         },
     )
 
@@ -27,12 +30,21 @@ def test_answer_submission_endpoint_works(monkeypatch):
         "adaptive_tutor.api.routes.submit_answer",
         lambda session_id, answer: {
             "session_id": session_id,
-            "evaluation": {"feedback": "Good", "score": 0.9},
+            "evaluation": {
+                "feedback": "Good",
+                "score": 0.9,
+                "is_correct": True,
+                "question_id": "q1",
+                "suggested_next_action": "CONTINUE",
+            },
             "teaching": None,
             "next_question": {"question_text": "Next?", "question_id": "q2"},
             "session_complete": False,
             "next_action": "CONTINUE",
             "current_level_index": 0,
+            "display_text": "Good\n\nQuestion: Next?",
+            "input_mode": "answer",
+            "ui_events": ["answer_submitted", "answer_correct", "question_presented", "state_synced"],
         },
     )
 
@@ -43,3 +55,4 @@ def test_answer_submission_endpoint_works(monkeypatch):
     assert data["session_id"] == "s1"
     assert data["evaluation"]["feedback"] == "Good"
     assert data["next_question"]["question_id"] == "q2"
+    assert isinstance(data["ui_events"], list)

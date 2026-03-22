@@ -14,6 +14,15 @@ Local-first adaptive learning backend using LangGraph orchestration, Gemini agen
 5. Run API:
    - `uvicorn adaptive_tutor.api.main:app --reload`
 
+Terminal 1:
+conda activate ds_mode
+cd adaptive_tutor
+uvicorn adaptive_tutor.api.main:app --host 127.0.0.1 --port 8000
+Terminal 2:
+conda activate ds_mode
+cd adaptive_tutor
+python frontend.py
+
 ## Notes
 
 - The engine owns progression and routing decisions.
