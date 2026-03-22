@@ -1,0 +1,47 @@
+# macOS hidden/system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Python bytecode/cache/temp
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Build/distribution artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Logs/coverage
+*.log
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment secrets
+.env
+
+# SQLite/runtime local data
+*.sqlite3
+*.db
+EOF
