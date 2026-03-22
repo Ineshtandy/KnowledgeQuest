@@ -10,8 +10,10 @@ from collections import deque
 from PIL import Image
 
 pygame.init()
-WIDTH, HEIGHT = 800, 700
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+DEFAULT_WIDTH, DEFAULT_HEIGHT = 1000, 900
+WINDOW_FLAGS = pygame.RESIZABLE
+screen = pygame.display.set_mode((DEFAULT_WIDTH, DEFAULT_HEIGHT), WINDOW_FLAGS)
+WIDTH, HEIGHT = screen.get_size()
 pygame.display.set_caption("Western Boss Fight")
 clock = pygame.time.Clock()
 font = pygame.font.Font(None, 28)
@@ -35,12 +37,43 @@ DESERT_DARK = (180, 150, 110)
 SKY_BLUE = (135, 206, 235)
 ROAD_GRAY = (120, 100, 80)
 
-# panel setup
-question_panel_height = 100
-chatbot_panel_height = 100
-gameplay_top = question_panel_height
-gameplay_bottom = HEIGHT - chatbot_panel_height
-gameplay_height = gameplay_bottom - gameplay_top
+# Layout setup
+MIN_WINDOW_WIDTH = 800
+MIN_WINDOW_HEIGHT = 600
+MIN_GAMEPLAY_HEIGHT = 320
+CHATBOT_PANEL_HEIGHT = 96
+
+question_panel_height = 0
+chatbot_panel_height = CHATBOT_PANEL_HEIGHT
+gameplay_top = 0
+gameplay_bottom = 0
+gameplay_height = 0
+gameplay_surface: pygame.Surface | None = None
+
+
+def _recompute_layout(new_width: int, new_height: int) -> None:
+    global WIDTH, HEIGHT
+    global question_panel_height, chatbot_panel_height
+    global gameplay_top, gameplay_bottom, gameplay_height
+    global gameplay_surface
+
+    WIDTH = max(MIN_WINDOW_WIDTH, int(new_width))
+    HEIGHT = max(MIN_WINDOW_HEIGHT, int(new_height))
+
+    chatbot_panel_height = CHATBOT_PANEL_HEIGHT
+
+    desired_question_height = max(180, int(HEIGHT * 0.30))
+    max_question_height = max(120, HEIGHT - chatbot_panel_height - MIN_GAMEPLAY_HEIGHT)
+    question_panel_height = max(120, min(desired_question_height, max_question_height))
+
+    gameplay_top = question_panel_height
+    gameplay_bottom = HEIGHT - chatbot_panel_height
+    gameplay_height = max(1, gameplay_bottom - gameplay_top)
+
+    gameplay_surface = pygame.Surface((WIDTH, gameplay_height))
+
+
+_recompute_layout(WIDTH, HEIGHT)
 
 # Load image and make background transparent
 def load_transparent_image(path, scale=1):
@@ -138,8 +171,29 @@ cowboy_img = load_transparent_image("cowboy.jpg", scale=0.25)
 cowboy_width, cowboy_height = cowboy_img.get_size()
 
 # boss setup
-bosses = [BossSprite("dragon.avif", 0.5), BossSprite("dragon.avif", 0.5)]
+bosses = [
+    BossSprite("b1.png", 0.5),
+    BossSprite("b2.png", 0.5),
+    BossSprite("b3.png", 0.5),
+    BossSprite("b4.png", 0.5),
+]
 boss_index = 0
+
+# Roadside props
+cactus_sprite = BossSprite("cacti.avif", 0.35)
+cactus_base_image = cactus_sprite.frames[0] if cactus_sprite.frames else cactus_sprite.image
+
+
+def _boss_index_for_level_index(level_index: int) -> int:
+    # Backend uses 0-based level indexes.
+    # Map: level 0 -> b1, level 1 -> b2, level 2 -> b3, level 3+ -> b4.
+    if level_index <= 0:
+        return 0
+    if level_index == 1:
+        return 1
+    if level_index == 2:
+        return 2
+    return 3
 
 # Visual HP rules (presentation only):
 # - max hp always 100
@@ -170,6 +224,34 @@ scroll_offset = 0.0
 scroll_speed = 2.5
 sky_height = 80
 
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _road_edges_at_y(y: float) -> tuple[float, float, float]:
+    """Returns (left_edge_x, right_edge_x, depth_t) for a given y in gameplay_surface coords."""
+    denom = max(1.0, float(gameplay_height - sky_height))
+    depth_t = _clamp((float(y) - float(sky_height)) / denom, 0.0, 1.0)
+    road_w = float(road_top_width) + depth_t * float(road_bottom_width - road_top_width)
+    left_edge_x = (WIDTH / 2.0) - (road_w / 2.0)
+    right_edge_x = (WIDTH / 2.0) + (road_w / 2.0)
+    return left_edge_x, right_edge_x, depth_t
+
+
+def _new_cactus_prop(*, y: float | None = None) -> dict:
+    side = random.choice(["left", "right"])
+    jitter = random.randint(-18, 18)
+    base_scale = random.uniform(0.90, 1.10)
+    if y is None:
+        y = float(random.randint(sky_height + 10, gameplay_height - 10))
+    return {"side": side, "y": float(y), "jitter": jitter, "base_scale": base_scale}
+
+
+roadside_cacti: list[dict] = []
+for _ in range(12):
+    roadside_cacti.append(_new_cactus_prop())
+
 # Backend-driven state
 API_BASE_URL = "http://127.0.0.1:8000"
 session_id: str | None = None
@@ -180,6 +262,9 @@ pending_events: deque[str] = deque()
 response_queue: queue.Queue[dict] = queue.Queue()
 top_scroll_y = 0
 top_scroll_step = 30
+backend_level_index = 0
+pending_boss_index: int | None = None
+pending_hp_after_transition: int | None = None
 
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -325,8 +410,7 @@ user_input = ""
 feedback = ""
 feedback_color = RED
 
-# set gameplay surface
-gameplay_surface = pygame.Surface((WIDTH, gameplay_height))
+assert gameplay_surface is not None
 bullets = []
 
 running = True
@@ -350,6 +434,10 @@ while running:
         result = msg.get("result") or {}
         if session_id is None and result.get("session_id"):
             session_id = result.get("session_id")
+
+        raw_level_index = result.get("current_level_index")
+        if isinstance(raw_level_index, int):
+            backend_level_index = raw_level_index
 
         new_display_text = str(result.get("display_text") or display_text)
         if new_display_text != display_text:
@@ -466,6 +554,33 @@ while running:
         y = random.randint(sky_height, gameplay_height)
         pygame.draw.circle(gameplay_surface, DESERT_DARK, (x, y), 2)
 
+    # roadside cacti (planted just outside the road edges)
+    cactus_margin = 22
+    min_cactus_scale = 0.25
+    max_cactus_scale = 0.85
+    for cactus in sorted(roadside_cacti, key=lambda c: c.get("y", 0.0)):
+        y_base = float(cactus.get("y", float(sky_height)))
+        if y_base < float(sky_height):
+            continue
+        left_edge_x, right_edge_x, depth_t = _road_edges_at_y(y_base)
+        prop_scale = (min_cactus_scale + depth_t * (max_cactus_scale - min_cactus_scale)) * float(cactus.get("base_scale", 1.0))
+
+        src_w, src_h = cactus_base_image.get_size()
+        dst_w = max(1, int(src_w * prop_scale))
+        dst_h = max(1, int(src_h * prop_scale))
+        cactus_img = pygame.transform.scale(cactus_base_image, (dst_w, dst_h))
+
+        jitter = int(cactus.get("jitter", 0))
+        if cactus.get("side") == "right":
+            x_base = int(right_edge_x + cactus_margin + jitter)
+        else:
+            x_base = int(left_edge_x - cactus_margin + jitter)
+
+        # Plant on the ground at y_base: bottom of sprite sits on y_base.
+        draw_x = x_base - (dst_w // 2)
+        draw_y = int(y_base) - dst_h
+        gameplay_surface.blit(cactus_img, (draw_x, draw_y))
+
     # set cowboy position
     cowboy_x = WIDTH // 2
     cowboy_y = gameplay_height - 60
@@ -492,11 +607,15 @@ while running:
         elif evt == "teaching_started":
             campfire_mode = True
         elif evt == "level_demoted":
-            boss_visual_hp = 75
-            if hp_anim_current < boss_visual_hp:
-                hp_anim_current = boss_visual_hp
+            pending_boss_index = _boss_index_for_level_index(backend_level_index)
+            pending_hp_after_transition = 75
+            boss_visual_hp = 0
+            hp_anim_current = 0
+            transitioning = True
         elif evt == "level_advanced":
             # HP may become 0 only as a finisher for backend-approved advancement.
+            pending_boss_index = _boss_index_for_level_index(backend_level_index)
+            pending_hp_after_transition = boss_visual_hp_max
             boss_visual_hp = 0
             hp_anim_current = 0
             transitioning = True
@@ -535,12 +654,19 @@ while running:
     if boss_visual_hp > 0:
         if hp_anim_current > boss_visual_hp:
             hp_anim_current -= 1
-        pygame.draw.rect(gameplay_surface, BLACK, (620,10,150,40))
-        pygame.draw.rect(gameplay_surface, WHITE, (620,10,150,40),2)
-        pygame.draw.rect(gameplay_surface, RED, (622,12,146,36))
-        green_w = int(146 * (hp_anim_current / boss_visual_hp_max))
-        pygame.draw.rect(gameplay_surface, GREEN, (622,12,green_w,36))
-        gameplay_surface.blit(font.render(f"{boss_visual_hp}", True, WHITE), (670,20))
+        hp_box_w = 150
+        hp_box_h = 40
+        hp_box_x = max(10, WIDTH - hp_box_w - 30)
+        hp_box_y = 10
+        pygame.draw.rect(gameplay_surface, BLACK, (hp_box_x, hp_box_y, hp_box_w, hp_box_h))
+        pygame.draw.rect(gameplay_surface, WHITE, (hp_box_x, hp_box_y, hp_box_w, hp_box_h), 2)
+        pygame.draw.rect(gameplay_surface, RED, (hp_box_x + 2, hp_box_y + 2, hp_box_w - 4, hp_box_h - 4))
+        green_w = int((hp_box_w - 4) * (hp_anim_current / boss_visual_hp_max))
+        pygame.draw.rect(gameplay_surface, GREEN, (hp_box_x + 2, hp_box_y + 2, green_w, hp_box_h - 4))
+        hp_label = font.render(f"{boss_visual_hp}", True, WHITE)
+        label_x = hp_box_x + (hp_box_w - hp_label.get_width()) // 2
+        label_y = hp_box_y + (hp_box_h - hp_label.get_height()) // 2
+        gameplay_surface.blit(hp_label, (label_x, label_y))
 
     # Teaching/campfire overlay
     if campfire_mode and not transitioning:
@@ -568,6 +694,11 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif event.type == pygame.VIDEORESIZE:
+            screen = pygame.display.set_mode((event.w, event.h), WINDOW_FLAGS)
+            _recompute_layout(event.w, event.h)
+            for cactus in roadside_cacti:
+                cactus["y"] = float(_clamp(float(cactus.get("y", float(sky_height))), float(sky_height + 10), float(gameplay_height - 10)))
         elif event.type == pygame.MOUSEWHEEL:
             top_scroll_y = max(0, min(top_scroll_max, top_scroll_y - event.y * top_scroll_step))
         elif event.type == pygame.KEYDOWN:
@@ -596,17 +727,26 @@ while running:
 
     if transitioning:
         scroll_offset += scroll_speed
+        for cactus in roadside_cacti:
+            cactus["y"] = float(cactus.get("y", float(sky_height))) + float(scroll_speed)
+            if float(cactus["y"]) > float(gameplay_height + 80):
+                cactus.update(_new_cactus_prop(y=float(random.randint(sky_height + 6, sky_height + 36))))
         if scroll_offset >= gameplay_height:
             scroll_offset = 0
             transitioning = False
             boss_phase_id += 1
-            # Advance boss sprite if available, otherwise keep the last one.
-            if boss_index < len(bosses) - 1:
-                boss_index += 1
-            boss_visual_hp = boss_visual_hp_max
-            hp_anim_current = boss_visual_hp_max
+            if pending_boss_index is not None:
+                boss_index = max(0, min(pending_boss_index, len(bosses) - 1))
+            else:
+                boss_index = max(0, min(_boss_index_for_level_index(backend_level_index), len(bosses) - 1))
+
+            next_hp = pending_hp_after_transition if pending_hp_after_transition is not None else boss_visual_hp_max
+            boss_visual_hp = next_hp
+            hp_anim_current = next_hp
             bullets.clear()
             damage_flash = 0
+            pending_boss_index = None
+            pending_hp_after_transition = None
 
     pygame.display.flip()
     clock.tick(60)
