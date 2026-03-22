@@ -18,6 +18,17 @@ def _thread_config(session_id: str) -> dict:
     return {"configurable": {"thread_id": session_id}}
 
 
+def _maybe_model_dump(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    dump_fn = getattr(value, "model_dump", None)
+    if callable(dump_fn):
+        return dump_fn()
+    return None
+
+
 def _extract_interrupt_question(result: dict[str, Any]) -> dict[str, Any] | None:
     interrupts = result.get("__interrupt__", [])
     if not interrupts:
@@ -170,9 +181,9 @@ def resume_session(session_id: str) -> dict:
     return {
         "session_id": session_id,
         "topic": state.get("topic"),
-        "question": question_obj.model_dump() if question_obj else None,
-        "teaching": teaching_obj.model_dump() if teaching_obj else None,
-        "evaluation": evaluation_obj.model_dump() if evaluation_obj else None,
+        "question": _maybe_model_dump(question_obj),
+        "teaching": _maybe_model_dump(teaching_obj),
+        "evaluation": _maybe_model_dump(evaluation_obj),
         "session_complete": state.get("session_complete", False),
         "next_action": state.get("next_action"),
         "current_level_index": state.get("current_level_index", 0),

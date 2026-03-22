@@ -15,12 +15,19 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Western Boss Fight")
 clock = pygame.time.Clock()
 font = pygame.font.Font(None, 28)
+question_font = pygame.font.Font(None, 30)
+input_font = pygame.font.Font(None, 30)
 
 # rgb color setup
 WHITE = (255, 255, 255)
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
 BLACK = (0, 0, 0)
+PARCHMENT = (248, 237, 214)
+PARCHMENT_EDGE = (120, 90, 60)
+INPUT_BG = (250, 250, 250)
+INPUT_EDGE = (65, 65, 65)
+INPUT_DISABLED = (225, 225, 225)
 
 # Western palette
 DESERT_SAND = (235, 160, 75)
@@ -171,6 +178,8 @@ input_mode = "topic"  # topic | answer | session_complete
 awaiting_backend = False
 pending_events: deque[str] = deque()
 response_queue: queue.Queue[dict] = queue.Queue()
+top_scroll_y = 0
+top_scroll_step = 30
 
 
 def _post_json(url: str, payload: dict) -> dict:
@@ -197,44 +206,121 @@ def _submit_to_backend(text: str) -> None:
         response_queue.put({"ok": False, "error": str(exc)})
 
 
-def _render_wrapped_text(surface: pygame.Surface, text: str, rect: pygame.Rect, color: tuple[int, int, int]) -> None:
-    words = (text or "").replace("\n", " \n ").split(" ")
-    x, y = rect.x, rect.y
-    line: list[str] = []
-    space_w = font.size(" ")[0]
-    max_w = rect.width
-    line_h = font.get_linesize()
+def _wrap_line(text: str, active_font: pygame.font.Font, max_w: int) -> list[str]:
+    if not text:
+        return [""]
 
-    def flush_line() -> None:
-        nonlocal x, y, line
-        if not line:
-            return
-        rendered = font.render(" ".join(line), True, color)
-        surface.blit(rendered, (x, y))
-        y += line_h
-        line = []
+    words = text.split(" ")
+    lines: list[str] = []
+    current = ""
 
-    for w in words:
-        if w == "\\n":
-            flush_line()
+    def push_current() -> None:
+        nonlocal current
+        lines.append(current)
+        current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if candidate and active_font.size(candidate)[0] <= max_w:
+            current = candidate
             continue
-        test = (" ".join(line + [w])).strip()
-        if test and font.size(test)[0] <= max_w:
-            line.append(w)
-        else:
-            flush_line()
-            if font.size(w)[0] <= max_w:
-                line = [w]
+
+        if current:
+            push_current()
+
+        if active_font.size(word)[0] <= max_w:
+            current = word
+            continue
+
+        # Hard break a very long token by characters.
+        chunk = ""
+        for ch in word:
+            chunk_candidate = f"{chunk}{ch}"
+            if chunk_candidate and active_font.size(chunk_candidate)[0] <= max_w:
+                chunk = chunk_candidate
             else:
-                # hard break very long tokens
-                for ch in w:
-                    test2 = ("".join(line) + ch)
-                    if font.size(test2)[0] <= max_w:
-                        line.append(ch)
-                    else:
-                        flush_line()
-                        line = [ch]
-    flush_line()
+                lines.append(chunk)
+                chunk = ch
+        current = chunk
+
+    if current:
+        push_current()
+
+    return lines
+
+
+def _layout_wrapped_lines(text: str, active_font: pygame.font.Font, max_w: int) -> list[str]:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    paragraph_lines = normalized.split("\n")
+
+    wrapped: list[str] = []
+    for paragraph in paragraph_lines:
+        if not paragraph:
+            wrapped.append("")
+            continue
+        wrapped.extend(_wrap_line(paragraph, active_font, max_w))
+    return wrapped
+
+
+def _measure_wrapped_text_height(
+    text: str,
+    active_font: pygame.font.Font,
+    max_w: int,
+    *,
+    line_spacing: int = 4,
+) -> int:
+    wrapped_lines = _layout_wrapped_lines(text, active_font, max_w)
+    line_h = active_font.get_linesize() + line_spacing
+    return max(line_h, len(wrapped_lines) * line_h)
+
+
+def _tail_text_for_width(text: str, active_font: pygame.font.Font, max_w: int) -> str:
+    if not text:
+        return ""
+    if active_font.size(text)[0] <= max_w:
+        return text
+
+    out = ""
+    for ch in reversed(text):
+        candidate = ch + out
+        if active_font.size(candidate)[0] <= max_w:
+            out = candidate
+        else:
+            break
+    return out
+
+
+def _render_wrapped_text(
+    surface: pygame.Surface,
+    text: str,
+    rect: pygame.Rect,
+    color: tuple[int, int, int],
+    *,
+    scroll_y: int,
+    active_font: pygame.font.Font,
+    line_spacing: int = 4,
+) -> tuple[bool, bool]:
+    wrapped_lines = _layout_wrapped_lines(text, active_font, rect.width)
+    line_h = active_font.get_linesize() + line_spacing
+    content_h = max(line_h, len(wrapped_lines) * line_h)
+    max_scroll = max(0, content_h - rect.height)
+    clamped_scroll = max(0, min(scroll_y, max_scroll))
+
+    start_idx = clamped_scroll // line_h
+    y = rect.y - (clamped_scroll % line_h)
+
+    old_clip = surface.get_clip()
+    surface.set_clip(rect)
+    for line in wrapped_lines[start_idx:]:
+        if y >= rect.bottom:
+            break
+        if y + line_h > rect.y:
+            rendered = active_font.render(line, True, color)
+            surface.blit(rendered, (rect.x, y))
+        y += line_h
+    surface.set_clip(old_clip)
+
+    return (clamped_scroll > 0, clamped_scroll < max_scroll)
 user_input = ""
 feedback = ""
 feedback_color = RED
@@ -265,7 +351,10 @@ while running:
         if session_id is None and result.get("session_id"):
             session_id = result.get("session_id")
 
-        display_text = str(result.get("display_text") or display_text)
+        new_display_text = str(result.get("display_text") or display_text)
+        if new_display_text != display_text:
+            top_scroll_y = 0
+        display_text = new_display_text
         input_mode = str(result.get("input_mode") or input_mode)
         events = result.get("ui_events") or []
         if isinstance(events, list):
@@ -276,27 +365,73 @@ while running:
             session_finished = True
 
     # question panel
-    pygame.draw.rect(screen, WHITE, (0, 0, WIDTH, question_panel_height))
-    pygame.draw.rect(screen, BLACK, (0, 0, WIDTH, question_panel_height), 2)
-    _render_wrapped_text(
+    pygame.draw.rect(screen, PARCHMENT, (0, 0, WIDTH, question_panel_height))
+    pygame.draw.rect(screen, PARCHMENT_EDGE, (0, 0, WIDTH, question_panel_height), 2)
+    question_text_rect = pygame.Rect(10, 10, WIDTH - 20, question_panel_height - 20)
+    top_content_h = _measure_wrapped_text_height(
+        display_text,
+        question_font,
+        question_text_rect.width,
+        line_spacing=6,
+    )
+    top_scroll_max = max(0, top_content_h - question_text_rect.height)
+    if top_scroll_y > top_scroll_max:
+        top_scroll_y = top_scroll_max
+
+    can_scroll_up, can_scroll_down = _render_wrapped_text(
         screen,
         display_text,
-        pygame.Rect(10, 10, WIDTH - 20, question_panel_height - 20),
+        question_text_rect,
         BLACK,
+        scroll_y=top_scroll_y,
+        active_font=question_font,
+        line_spacing=6,
     )
+    if can_scroll_up:
+        screen.blit(font.render("^", True, PARCHMENT_EDGE), (WIDTH - 28, 6))
+    if can_scroll_down:
+        screen.blit(font.render("v", True, PARCHMENT_EDGE), (WIDTH - 28, question_panel_height - 30))
 
     # chatbot panel
     pygame.draw.rect(screen, WHITE, (0, HEIGHT-chatbot_panel_height, WIDTH, chatbot_panel_height))
     pygame.draw.rect(screen, BLACK, (0, HEIGHT-chatbot_panel_height, WIDTH, chatbot_panel_height), 2)
     if input_mode == "topic":
-        prompt = "Type a topic: "
+        prompt = "Type a topic"
     elif input_mode == "session_complete":
         prompt = "Session complete"
     else:
-        prompt = "Type your answer: "
+        prompt = "Type your answer"
 
-    screen.blit(font.render(prompt + user_input, True, BLACK), (10, HEIGHT-90))
-    screen.blit(font.render(feedback, True, feedback_color), (10, HEIGHT-50))
+    prompt_surface = font.render(f"{prompt}:", True, BLACK)
+    prompt_y = HEIGHT - chatbot_panel_height + 8
+    screen.blit(prompt_surface, (10, prompt_y))
+
+    input_rect = pygame.Rect(10, HEIGHT - chatbot_panel_height + 36, WIDTH - 20, 36)
+    if awaiting_backend or input_mode == "session_complete":
+        fill_color = INPUT_DISABLED
+    else:
+        fill_color = INPUT_BG
+    pygame.draw.rect(screen, fill_color, input_rect)
+    pygame.draw.rect(screen, INPUT_EDGE, input_rect, 2)
+
+    input_padding_x = 8
+    visible_area_w = input_rect.width - (input_padding_x * 2)
+    visible_text = _tail_text_for_width(user_input, input_font, visible_area_w)
+    text_surface = input_font.render(visible_text, True, BLACK)
+    text_x = input_rect.x + input_padding_x
+    text_y = input_rect.y + (input_rect.height - text_surface.get_height()) // 2
+    screen.blit(text_surface, (text_x, text_y))
+
+    # Blinking caret indicates the field is active.
+    caret_on = ((pygame.time.get_ticks() // 500) % 2 == 0)
+    if input_mode != "session_complete" and not awaiting_backend and caret_on:
+        caret_x = text_x + text_surface.get_width() + 1
+        caret_top = input_rect.y + 6
+        caret_bottom = input_rect.y + input_rect.height - 6
+        if caret_x <= input_rect.right - input_padding_x:
+            pygame.draw.line(screen, BLACK, (caret_x, caret_top), (caret_x, caret_bottom), 2)
+
+    screen.blit(font.render(feedback, True, feedback_color), (10, HEIGHT-22))
 
     # fill initial game surface
     gameplay_surface.fill(DESERT_SAND)
@@ -433,21 +568,31 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        elif event.type == pygame.KEYDOWN and not transitioning and not session_finished:
-            if event.key == pygame.K_RETURN:
-                typed = user_input.strip()
-                if not typed or awaiting_backend:
-                    continue
-                awaiting_backend = True
-                feedback = "Thinking..."
-                feedback_color = BLACK
-                user_input = ""
-                t = threading.Thread(target=_submit_to_backend, args=(typed,), daemon=True)
-                t.start()
-            elif event.key == pygame.K_BACKSPACE:
-                user_input = user_input[:-1]
-            else:
-                user_input += event.unicode
+        elif event.type == pygame.MOUSEWHEEL:
+            top_scroll_y = max(0, min(top_scroll_max, top_scroll_y - event.y * top_scroll_step))
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_UP:
+                top_scroll_y = max(0, min(top_scroll_max, top_scroll_y - top_scroll_step))
+                continue
+            if event.key == pygame.K_DOWN:
+                top_scroll_y = max(0, min(top_scroll_max, top_scroll_y + top_scroll_step))
+                continue
+
+            if not transitioning and not session_finished:
+                if event.key == pygame.K_RETURN:
+                    typed = user_input.strip()
+                    if not typed or awaiting_backend:
+                        continue
+                    awaiting_backend = True
+                    feedback = "Thinking..."
+                    feedback_color = BLACK
+                    user_input = ""
+                    t = threading.Thread(target=_submit_to_backend, args=(typed,), daemon=True)
+                    t.start()
+                elif event.key == pygame.K_BACKSPACE:
+                    user_input = user_input[:-1]
+                else:
+                    user_input += event.unicode
 
     if transitioning:
         scroll_offset += scroll_speed
