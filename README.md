@@ -65,10 +65,8 @@ There’s a helper script to validate DB-backed resume behavior without needing 
 - `python adaptive_tutor/verify_persistence.py --mode seed`
 - `python adaptive_tutor/verify_persistence.py --mode inspect --db data/app.db --list-sessions 10`
 
-## Tests
+## DevPost
 
-After installing deps:
-
-- `cd adaptive_tutor && pytest`
+Find more at this submission [link](https://devpost.com/software/knowledge-quest-37k5jq)
 
 If you see import errors like missing `fastapi`, `langgraph`, or `google.genai`, it usually means the current Python environment didn’t have dependencies installed (re-run the editable install command above in the same environment).
